@@ -9,29 +9,24 @@ from collections import deque
 import matplotlib.pyplot as plt
 import pickle
 
+device = torch.device("mps")
+
 # === Environment Class for Quadcopter Control ===
 class QuadcopterEnv(gym.Env):
     def __init__(self):
         super(QuadcopterEnv, self).__init__()
-        # Define action and observation space
-        # Actions: thrust adjustments for each motor (continuous range)
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)  # thrust for 4 motors
-        
-        # Observations: position, velocity, orientation, angular velocity
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32) 
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
         
-        self.mass = 0.033  
+        self.mass = 0.033
         self.inertia = np.diag(np.array([16.57e-6, 16.66e-6, 29.26e-6]))
-        self.gravity = np.array([0, 0, -9.81])  
+        self.gravity = np.array([0, 0, -9.81*self.mass])  
         self.L = 0.028 
         self.Cb = 0.0059  
         self.Cd = 9.18e-7  
         self.dt = 0.05 
         self.max_time_step = 200
-        self.episode = 1
-
-        # Initial state
-        self.state = None
+        self.episode = 0
         self.reset()
 
     def reset(self):
@@ -56,58 +51,42 @@ class QuadcopterEnv(gym.Env):
         self.angular_velocity = np.zeros(3)
 
         relative_position = self.position - self.target_position
-        self.distance = np.linalg.norm(relative_position)
         self.state = np.concatenate((
             relative_position, 
             self.linear_velocity, 
             self.orientation, 
-            self.angular_velocity, 
+            self.angular_velocity
         ))
         self.time_step = 0
         return self.state
 
     def rotation_matrix(self, roll, pitch, yaw):
-        R_x = np.array([
-            [1, 0, 0],
-            [0, np.cos(roll), -np.sin(roll)],
-            [0, np.sin(roll), np.cos(roll)]
-        ])
+        c_r, s_r = np.cos(roll), np.sin(roll)
+        c_p, s_p = np.cos(pitch), np.sin(pitch)
+        c_y, s_y = np.cos(yaw), np.sin(yaw)
 
-        R_y = np.array([
-            [np.cos(pitch), 0, np.sin(pitch)],
-            [0, 1, 0],
-            [-np.sin(pitch), 0, np.cos(pitch)]
+        return np.array([
+            [c_y * c_p, c_y * s_p * s_r - s_y * c_r, c_y * s_p * c_r + s_y * s_r],
+            [s_y * c_p, s_y * s_p * s_r + c_y * c_r, s_y * s_p * c_r - c_y * s_r],
+            [-s_p, c_p * s_r, c_p * c_r]
         ])
-
-        R_z = np.array([
-            [np.cos(yaw), -np.sin(yaw), 0],
-            [np.sin(yaw), np.cos(yaw), 0],
-            [0, 0, 1]
-        ])
-
-        R = R_z @ R_y @ R_x
-        return R
     
     def step(self, action):
         # Simulate the quadcopter dynamics and update the state
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        action = (action + 1) / 2
+        total_thrust = np.sum(action)
 
-        thrusts = action  # Keep the action output as thrust for simplicity
-        
-        total_thrust = np.sum(thrusts)
-
-        tau_x = self.L * self.Cb * (thrusts[1] - thrusts[3])
-        tau_y = self.L * self.Cb * (thrusts[0] - thrusts[2])
-        tau_z = self.Cd * (thrusts[0] - thrusts[1] + thrusts[2] - thrusts[3])
-        torque = np.array([tau_x, tau_y, tau_z])
+        torque = np.array([
+            self.L * self.Cb * (action[1] - action[3]),
+            self.L * self.Cb * (action[0] - action[2]),
+            self.Cd * (action[0] - action[1] + action[2] - action[3])
+        ])
 
         R = self.rotation_matrix(*self.orientation)
 
-        thrust_body_frame = np.array([0, 0, total_thrust])
-        thrust_world_frame = R @ thrust_body_frame
+        thrust_world_frame = R @ np.array([0, 0, total_thrust])
 
-        total_force = thrust_world_frame + self.gravity * self.mass
+        total_force = thrust_world_frame + self.gravity
         self.linear_acceleration = total_force / self.mass 
 
         omega_cross_Jomega = np.cross(self.angular_velocity, self.inertia @ self.angular_velocity)
@@ -131,35 +110,30 @@ class QuadcopterEnv(gym.Env):
             self.angular_velocity, 
         ))
 
-        reward = self._calculate_reward(next_state)
+        reward = self._calculate_reward()
         done = self._check_done(next_state)
         self.state = next_state
         return next_state, reward, done, {}
 
-    def _calculate_reward(self, state):
+    def _calculate_reward(self):
         distance = np.linalg.norm(self.position - self.target_position)
         orientation_penalty = np.sum(np.abs(self.orientation)) * 0.2
         stability_penalty = np.sum(np.abs(self.angular_velocity)) * 0.1
         velocity_penalty = np.sum(np.abs(self.linear_velocity)) * 0.1 
         
         # Smoother reward function
-        distance_reward = np.exp(-2.0 * distance)  # Exponential decay
-        reward = 1.5 + distance_reward - orientation_penalty - stability_penalty - velocity_penalty 
+        distance_reward = np.exp(-20.0 * distance**2)  # Exponential decay
+        reward = 100 * distance_reward - orientation_penalty - stability_penalty - velocity_penalty 
         return reward
 
     def _check_done(self, state):
-        # Check if the quadcopter has reached a terminal condition
-        position_out = np.linalg.norm(self.position - self.target_position) > 10.0
-        orientation_out = np.any(np.abs(self.orientation) > np.pi/2)  # 90 degrees
-        angular_velocity_out = np.any(np.abs(self.angular_velocity) > 5.0)
-        timeout = self.time_step > self.max_time_step
-        if position_out or orientation_out or angular_velocity_out or timeout:
+        if np.linalg.norm(self.position - self.target_position) > 10.0 or self.time_step > self.max_time_step:
             return True
         return False
 
 # === SAC Network Classes ===
 class CriticNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128):
+    def __init__(self, input_dim, hidden_dim=256):
         super(CriticNetwork, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -190,60 +164,65 @@ class ActorNetwork(nn.Module):
         x = F.relu(self.batch_norm1(self.fc1(state)))
         x = F.relu(self.batch_norm2(self.fc2(x)))
         x = self.dropout(F.relu(self.fc3(x)))
-        mean = torch.tanh(self.mean(x))  # Use tanh to keep mean output in range (-1, 1)
+        mean = torch.sigmoid(self.mean(x))  
         log_std = torch.clamp(self.log_std(x), min=-20, max=20)
         std = log_std.exp()
         return mean, std
 
 # === Improved SAC Agent ===
 class SACAgent:
-    def __init__(self, state_dim, action_dim, actor_lr=3e-4, critic_lr=3e-4, alpha_lr=3e-4, gamma=0.99, tau=0.005):
-        self.actor = ActorNetwork(state_dim, action_dim)
-        self.critic1 = CriticNetwork(state_dim + action_dim)
-        self.critic2 = CriticNetwork(state_dim + action_dim)
-        self.target_critic1 = CriticNetwork(state_dim + action_dim)
-        self.target_critic2 = CriticNetwork(state_dim + action_dim)
+    def __init__(self, state_dim, action_dim, actor_lr=3e-4, critic_lr=1e-4, alpha_lr=1e-4, gamma=0.99, tau=0.005):
+        # Initialize networks and move them to the available device
+        self.device = device
+        
+        self.actor = ActorNetwork(state_dim, action_dim).to(self.device)
+        self.critic1 = CriticNetwork(state_dim + action_dim).to(self.device)
+        self.critic2 = CriticNetwork(state_dim + action_dim).to(self.device)
+        self.target_critic1 = CriticNetwork(state_dim + action_dim).to(self.device)
+        self.target_critic2 = CriticNetwork(state_dim + action_dim).to(self.device)
         
         # Copy weights from critic to target_critic
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
-        
+
+        # Optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=critic_lr)
         self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=critic_lr)
-        
-        self.log_alpha = torch.tensor(np.log(0.2), requires_grad=True)
+        self.log_alpha = torch.tensor(np.log(0.2), dtype=torch.float32, requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha_lr)
         self.alpha = self.log_alpha.exp()
-        
+
+        # Hyperparameters
         self.gamma = gamma
         self.tau = tau
         self.memory = deque(maxlen=1000000)
-        self.batch_size = 2048  # Increased batch size for more stable learning
+        self.batch_size = 4000  
         self.target_entropy = -action_dim
-        self.weight_decay = 0.0
+        self.i = 0
 
     def select_action(self, state):
-        state = torch.FloatTensor(np.array(state)).unsqueeze(0)  # Convert state to a numpy array before converting to tensor
+        state = torch.FloatTensor(np.array(state)).unsqueeze(0).to(self.device)
         mean, std = self.actor(state)
         normal = torch.distributions.Normal(mean, std)
         action = normal.sample()
-        action = action.clamp(-1, 1)  
-        return action.detach().numpy()[0]
+        action = action.clamp(-1, 1)  # Clamp action to valid range (-1, 1)
+        return action.cpu().detach().numpy()[0]
 
     def update(self):
         if len(self.memory) < self.batch_size:
             return
+        
         batch = random.sample(self.memory, self.batch_size)
         state, action, reward, next_state, done = zip(*batch)
         
-        # Convert to torch tensors
-        state = torch.FloatTensor(np.array(state))
-        action = torch.FloatTensor(np.array(action))  # Convert list of arrays to a single numpy array before converting to tensor
-        reward = torch.FloatTensor(reward).unsqueeze(1)
-        next_state = torch.FloatTensor(np.array(next_state))
-        done = torch.FloatTensor(done).unsqueeze(1)
-        
+        # Convert to torch tensors and move to device
+        state = torch.FloatTensor(np.array(state)).to(self.device)
+        action = torch.FloatTensor(np.array(action)).to(self.device)
+        reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
+        next_state = torch.FloatTensor(np.array(next_state)).to(self.device)
+        done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
+
         # Compute target Q value
         with torch.no_grad():
             next_action_mean, next_action_std = self.actor(next_state)
@@ -255,7 +234,7 @@ class SACAgent:
             target_q2 = self.target_critic2(next_state, next_action)
             target_q = torch.min(target_q1, target_q2) - self.alpha * next_action_log_prob
             target_q = reward + (1 - done) * self.gamma * target_q
-        
+
         # Update critics
         current_q1 = self.critic1(state, action)
         current_q2 = self.critic2(state, action)
@@ -298,25 +277,62 @@ class SACAgent:
 
     def store_transition(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
+        
+    def save_checkpoint(self, agent, replay_buffer, all_rewards, all_states, episode, filepath):
+        checkpoint = {
+            'actor_state_dict': agent.actor.state_dict(),
+            'critic1_state_dict': agent.critic1.state_dict(),
+            'critic2_state_dict': agent.critic2.state_dict(),
+            'target_critic1_state_dict': agent.target_critic1.state_dict(),
+            'target_critic2_state_dict': agent.target_critic2.state_dict(),
+            'actor_optimizer_state_dict': agent.actor_optimizer.state_dict(),
+            'critic1_optimizer_state_dict': agent.critic1_optimizer.state_dict(),
+            'critic2_optimizer_state_dict': agent.critic2_optimizer.state_dict(),
+            'alpha_optimizer_state_dict': agent.alpha_optimizer.state_dict(),
+            'log_alpha': agent.log_alpha,
+            'replay_buffer': list(replay_buffer),
+            'all_rewards': all_rewards,
+            'all_states': all_states,
+            'episode': episode
+        }
+        torch.save(checkpoint, filepath)
 
-    def save_model(self, model, filepath):
-        """Save the model to the specified filepath."""
-        torch.save(model.state_dict(), filepath)
+    def load_checkpoint(self, agent, filepath):
+        checkpoint = torch.load(filepath, map_location=agent.device)
+        
+        # Load model states
+        agent.actor.load_state_dict(checkpoint['actor_state_dict'])
+        agent.critic1.load_state_dict(checkpoint['critic1_state_dict'])
+        agent.critic2.load_state_dict(checkpoint['critic2_state_dict'])
+        agent.target_critic1.load_state_dict(checkpoint['target_critic1_state_dict'])
+        agent.target_critic2.load_state_dict(checkpoint['target_critic2_state_dict'])
+        
+        # Load optimizers
+        agent.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        agent.critic1_optimizer.load_state_dict(checkpoint['critic1_optimizer_state_dict'])
+        agent.critic2_optimizer.load_state_dict(checkpoint['critic2_optimizer_state_dict'])
+        agent.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
+        
+        # Load log alpha and replay buffer
+        agent.log_alpha = checkpoint['log_alpha']
+        agent.alpha = agent.log_alpha.exp()
+        loaded_memory = deque(checkpoint['replay_buffer'], maxlen=1000000)
+        agent.memory = deque(loaded_memory, maxlen=1000000) 
+        
+        # Load rewards, states, and episode count
+        all_rewards = checkpoint['all_rewards']
+        all_states = checkpoint['all_states']
+        episode = checkpoint['episode']
 
-    def load_model(self, model, filepath):
-        """Load the model from the specified filepath."""
-        model.load_state_dict(torch.load(filepath))
-        model.eval()
+        return all_rewards, all_states, episode
 
 # === Training Loop ===
 env = QuadcopterEnv()
 agent = SACAgent(state_dim=env.observation_space.shape[0], action_dim=env.action_space.shape[0])
-num_episodes = 12000
+num_episodes = 120000
 all_states = []
 all_rewards = []
-# agent.load_model(agent.actor, "actor_model.pth")
-# agent.load_model(agent.critic1, "critic1_model.pth")
-# agent.load_model(agent.critic2, "critic2_model.pth")
+all_rewards, all_states, episode = agent.load_checkpoint(agent, "sac_checkpoint_prev.pth")
 
 for episode in range(num_episodes):
     state = env.reset()
@@ -336,10 +352,8 @@ for episode in range(num_episodes):
     all_rewards.append(total_reward)
     all_states.append(np.array(trajectory))
     print(f"Episode {episode + 1}, Total Reward: {total_reward:.2f}, Steps: {steps - 1}")
-    if episode % 100 == 0:
-        agent.save_model(agent.actor, "actor_model.pth")
-        agent.save_model(agent.critic1, "critic1_model.pth")
-        agent.save_model(agent.critic2, "critic2_model.pth")
+    if (episode + 1) % 100 == 0:
+        agent.save_checkpoint(agent, agent.memory, all_rewards, all_states, episode, "sac_checkpoint.pth")
         data_to_save = {
             "states": all_states,
             "rewards": all_rewards
@@ -362,6 +376,3 @@ data_to_save = {
 with open("states_and_rewards.pkl", "wb") as f:
     pickle.dump(data_to_save, f)
 
-agent.save_model(agent.actor, "actor_model.pth")
-agent.save_model(agent.critic1, "critic1_model.pth")
-agent.save_model(agent.critic2, "critic2_model.pth")

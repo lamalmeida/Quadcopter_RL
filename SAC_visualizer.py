@@ -13,7 +13,7 @@ all_states = data["states"]
 all_rewards = data["rewards"]
 
 # Specify the episodes you want to plot
-episodes = [1500, 3000, 6000]  # Change this to the list of episodes you want to plot
+episodes = [2100]
 
 # Plot the trajectories and orientations for the specified episodes
 for episode in episodes:
@@ -35,9 +35,9 @@ for episode in episodes:
         ax = fig.add_subplot(111, projection='3d')
 
         # Set fixed camera view
-        ax.set_xlim([-6.5, 6.5])
-        ax.set_ylim([-6.5, 6.5])
-        ax.set_zlim([-6.5, 6.5])
+        ax.set_xlim([-2, 2])
+        ax.set_ylim([-2, 2])
+        ax.set_zlim([-2, 2])
         ax.set_box_aspect([1, 1, 1])  # Equal aspect ratio for all axes
         ax.view_init(elev=20, azim=30)  # Set a default elevation and azimuth angle for the view
 
@@ -45,9 +45,9 @@ for episode in episodes:
 
         for i in range(len(positions)):
             ax.clear()
-            ax.set_xlim([-6.5, 6.5])
-            ax.set_ylim([-6.5, 6.5])
-            ax.set_zlim([-6.5, 6.5])
+            ax.set_xlim([-2, 2])
+            ax.set_ylim([-2, 2])
+            ax.set_zlim([-2, 2])
             ax.set_box_aspect([1, 1, 1])  # Equal aspect ratio for all axes
             ax.view_init(elev=20, azim=30)  # Keep the camera view consistent
 
